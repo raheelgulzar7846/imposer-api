@@ -24,8 +24,8 @@ from algorithm import detect_rotation
 # ============================================================
 app = FastAPI(
     title="Imposer API",
-    description="Shape-matching rotation detection for prepress imposition",
-    version="0.1.0",
+    description="Universal feature-based rotation detection for prepress imposition",
+    version="0.2.0",
 )
 
 # CORS — allow CEP plugin (origin file://, https://localhost, etc.)
@@ -66,9 +66,13 @@ class DetectRequest(BaseModel):
 class DetectResponse(BaseModel):
     angle: int
     confidence: float = Field(..., ge=0.0, le=1.0)
-    margin: float
+    method: Optional[str] = Field(None, description="'feature', 'iou', or 'error'")
+    margin: Optional[float] = None
     second_best: Optional[int] = None
     aspect_ratio_used: bool = False
+    raw_angle: Optional[float] = None
+    ref_feature_angle: Optional[float] = None
+    sheet_feature_angle: Optional[float] = None
     elapsed_ms: int
     error: Optional[str] = None
 
@@ -125,9 +129,13 @@ def detect(request: DetectRequest):
         return DetectResponse(
             angle=int(result['angle']),
             confidence=float(result['confidence']),
-            margin=float(result['margin']),
+            method=result.get('method'),
+            margin=result.get('margin'),
             second_best=result.get('second_best'),
             aspect_ratio_used=result.get('aspect_ratio_used', False),
+            raw_angle=result.get('raw_angle'),
+            ref_feature_angle=result.get('ref_feature_angle'),
+            sheet_feature_angle=result.get('sheet_feature_angle'),
             elapsed_ms=elapsed_ms,
             error=result.get('error'),
         )
@@ -147,9 +155,13 @@ def detect_batch(request: BatchDetectRequest):
             results.append(DetectResponse(
                 angle=int(r['angle']),
                 confidence=float(r['confidence']),
-                margin=float(r['margin']),
+                method=r.get('method'),
+                margin=r.get('margin'),
                 second_best=r.get('second_best'),
                 aspect_ratio_used=r.get('aspect_ratio_used', False),
+                raw_angle=r.get('raw_angle'),
+                ref_feature_angle=r.get('ref_feature_angle'),
+                sheet_feature_angle=r.get('sheet_feature_angle'),
                 elapsed_ms=int((time.perf_counter() - die_start) * 1000),
                 error=r.get('error'),
             ))
@@ -157,7 +169,7 @@ def detect_batch(request: BatchDetectRequest):
             results.append(DetectResponse(
                 angle=0,
                 confidence=0.0,
-                margin=0.0,
+                method='error',
                 elapsed_ms=int((time.perf_counter() - die_start) * 1000),
                 error=str(e),
             ))

@@ -263,6 +263,133 @@ def detect_by_iou(ref_poly, sheet_poly):
 
 
 # ============================================================
+# POINT-CLOUD MATCHING METHOD (fine tiebreaker — "human-like")
+# ============================================================
+# Area-IoU is too coarse: a near-symmetric die scores almost identically at
+# 0 vs 180, so IoU ties and defaults to 0. But matching the actual outline
+# POINTS (after rotation) is sensitive to the small asymmetric feature even
+# when area overlap isn't. This is the logic that previously got 14/16.
+
+def _resample(poly, n=96):
+    """Sample n equally-spaced points along the polygon perimeter."""
+    ext = poly.exterior
+    pts = []
+    for i in range(n):
+        p = ext.interpolate(i / float(n), normalized=True)
+        pts.append((p.x, p.y))
+    return pts
+
+
+def _rotate_pts(pts, deg):
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    return [(x * c - y * s, x * s + y * c) for (x, y) in pts]
+
+
+def _mean_nn_dist(a, b):
+    """Average nearest-neighbour distance from each point in a to set b."""
+    total = 0.0
+    for (ax, ay) in a:
+        best = float('inf')
+        for (bx, by) in b:
+            dx, dy = ax - bx, ay - by
+            d = dx * dx + dy * dy
+            if d < best:
+                best = d
+        total += math.sqrt(best)
+    return total / len(a)
+
+
+def detect_by_point_match(ref_poly, sheet_poly):
+    """
+    Match outline point-clouds at each candidate angle. Lower distance = better
+    fit. Confidence comes from how clearly the best angle beats the runner-up.
+    Returns None only if shapes are genuinely indistinguishable at all angles.
+    """
+    ref_c = center_at_origin(ref_poly)
+    sheet_c = normalize_scale(center_at_origin(sheet_poly), ref_poly.area)
+
+    R = _resample(ref_c, 96)
+    S = _resample(sheet_c, 96)
+
+    rb = ref_c.bounds
+    size = max(rb[2] - rb[0], rb[3] - rb[1])
+    if size < 1e-9:
+        return None
+
+    candidates = candidate_angles(ref_c, sheet_c)
+    scored = []
+    for ang in candidates:
+        Rr = _rotate_pts(R, ang)
+        # symmetric mean nearest-neighbour distance, normalized by die size
+        d = (_mean_nn_dist(Rr, S) + _mean_nn_dist(S, Rr)) / 2.0 / size
+        scored.append((ang, d))
+
+    scored.sort(key=lambda x: x[1])  # smaller distance first
+    best_angle, best_d = scored[0]
+    second_d = scored[1][1] if len(scored) > 1 else best_d * 3
+
+    # Relative separation between best and runner-up.
+    # Big separation = confident; near-zero = truly symmetric die.
+    denom = (best_d + second_d) / 2.0
+    margin = (second_d - best_d) / denom if denom > 1e-9 else 0.0
+    confidence = max(0.0, min(1.0, margin * 4.0))  # ~25% separation = full conf
+
+    return {
+        'angle': int(best_angle),
+        'confidence': round(confidence, 4),
+        'method': 'point-match',
+        'margin': round(margin, 4),
+        'best_dist': round(best_d, 4),
+        'second_dist': round(second_d, 4),
+        'candidates_tested': [(a, round(d, 4)) for a, d in scored],
+    }
+
+
+# ============================================================
+# FIRST-POINT METHOD (PRIMARY — proven, deterministic 0/180)
+# ============================================================
+# The dieline path has a deterministic starting anchor. When the die is
+# rotated 180 deg, that first point moves to the opposite side of the
+# bbox center. Points arrive in path order, so points[0] IS that anchor.
+# Compare which side of center the first point sits on, for reference vs
+# sheet: same side = 0 deg, opposite side = 180 deg. Exact, no guessing.
+
+def _first_point_side(points):
+    """Return True if the path's first anchor is right of the bbox center-x."""
+    xs = [p[0] for p in points]
+    cx = (min(xs) + max(xs)) / 2.0
+    first_x = points[0][0]
+    # margin relative to die width — guards against a first point sitting
+    # almost exactly on the center line (ambiguous)
+    width = max(xs) - min(xs)
+    if width < 1e-9:
+        return None
+    rel = (first_x - cx) / width
+    if abs(rel) < 0.02:   # within 2% of center => ambiguous
+        return None
+    return first_x > cx
+
+
+def detect_by_first_point(reference_points, sheet_points):
+    """Deterministic 0/180 detection from first-anchor position."""
+    if len(reference_points) < 3 or len(sheet_points) < 3:
+        return None
+    ref_right = _first_point_side(reference_points)
+    sheet_right = _first_point_side(sheet_points)
+    if ref_right is None or sheet_right is None:
+        return None
+    angle = 0 if (ref_right == sheet_right) else 180
+    return {
+        'angle': angle,
+        'confidence': 1.0,
+        'method': 'first-point',
+        'ref_first_right': ref_right,
+        'sheet_first_right': sheet_right,
+    }
+
+
+# ============================================================
 # MAIN ENTRY POINT
 # ============================================================
 def detect_rotation(reference_points, sheet_points, fine=False):
@@ -277,6 +404,16 @@ def detect_rotation(reference_points, sheet_points, fine=False):
     Use the FIRST method that gives high confidence. If multiple give answers,
     centroid wins for boxes (it's specifically designed for them).
     """
+    # ---- PRIMARY: first-point method (deterministic, proven on real dies) ----
+    # Runs on the RAW points (path order preserved) before any polygon
+    # processing that could reorder them.
+    try:
+        fp_result = detect_by_first_point(reference_points, sheet_points)
+        if fp_result:
+            return fp_result
+    except Exception:
+        pass  # fall through to geometric methods if first point is unusable
+
     try:
         ref_poly = points_to_polygon(reference_points)
         sheet_poly = points_to_polygon(sheet_points)
@@ -308,13 +445,22 @@ def detect_rotation(reference_points, sheet_points, fine=False):
     if iou_result.get('margin', 0) > 0.05:
         return iou_result
 
-    # IoU is ambiguous (tied). Use whatever centroid/feature said, even at low confidence.
+    # IoU tied (near-symmetric die). Don't give up — match the actual outline
+    # points, which catches the small asymmetric feature IoU's area misses.
+    pm_result = detect_by_point_match(ref_poly, sheet_poly)
+    if pm_result and pm_result['confidence'] >= 0.15:
+        return pm_result
+
+    # Still ambiguous — fall back to any low-confidence centroid/feature signal.
     if centroid_result:
-        centroid_result['note'] = 'low-conf-but-used (IoU was tied)'
+        centroid_result['note'] = 'low-conf-but-used (everything else tied)'
         return centroid_result
     if feature_result:
-        feature_result['note'] = 'low-conf-but-used (IoU was tied)'
+        feature_result['note'] = 'low-conf-but-used (everything else tied)'
         return feature_result
+    if pm_result:
+        pm_result['note'] = 'low-conf-but-used (best available)'
+        return pm_result
 
-    # Last resort: tied IoU defaults to 0°
+    # Truly indistinguishable shape — safest assumption is 0°.
     return iou_result

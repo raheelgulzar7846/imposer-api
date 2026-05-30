@@ -347,45 +347,72 @@ def detect_by_point_match(ref_poly, sheet_poly):
 
 
 # ============================================================
-# FIRST-POINT METHOD (PRIMARY — proven, deterministic 0/180)
+# FIRST-POINT METHOD (PRIMARY — proven, deterministic)
 # ============================================================
-# The dieline path has a deterministic starting anchor. When the die is
-# rotated 180 deg, that first point moves to the opposite side of the
-# bbox center. Points arrive in path order, so points[0] IS that anchor.
-# Compare which side of center the first point sits on, for reference vs
-# sheet: same side = 0 deg, opposite side = 180 deg. Exact, no guessing.
+# The dieline path has a deterministic starting anchor. Points arrive in
+# path order, so points[0] IS that anchor. Take the vector from the die's
+# bbox-center to that first point. When the die rotates, this vector rotates
+# with it by the same amount. Comparing the reference vector's angle to the
+# sheet vector's angle gives the rotation directly — snapped to 0/90/180/-90.
+# This is the same signal the working ExtendScript used, generalized to all
+# four orthogonal rotations.
 
-def _first_point_side(points):
-    """Return True if the path's first anchor is right of the bbox center-x."""
+def _first_point_vector(points):
+    """Vector (dx, dy) from bbox center to the path's first anchor + its magnitude."""
     xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
     cx = (min(xs) + max(xs)) / 2.0
-    first_x = points[0][0]
-    # margin relative to die width — guards against a first point sitting
-    # almost exactly on the center line (ambiguous)
-    width = max(xs) - min(xs)
-    if width < 1e-9:
-        return None
-    rel = (first_x - cx) / width
-    if abs(rel) < 0.02:   # within 2% of center => ambiguous
-        return None
-    return first_x > cx
+    cy = (min(ys) + max(ys)) / 2.0
+    dx = points[0][0] - cx
+    dy = points[0][1] - cy
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    mag = math.hypot(dx, dy) / diag if diag > 1e-9 else 0.0
+    return dx, dy, mag
 
 
 def detect_by_first_point(reference_points, sheet_points):
-    """Deterministic 0/180 detection from first-anchor position."""
+    """Deterministic 0/90/180/-90 detection from first-anchor angular position."""
     if len(reference_points) < 3 or len(sheet_points) < 3:
         return None
-    ref_right = _first_point_side(reference_points)
-    sheet_right = _first_point_side(sheet_points)
-    if ref_right is None or sheet_right is None:
+
+    rdx, rdy, rmag = _first_point_vector(reference_points)
+    sdx, sdy, smag = _first_point_vector(sheet_points)
+
+    # First point must be meaningfully off-center to give a clean angle.
+    if rmag < 0.05 or smag < 0.05:
         return None
-    angle = 0 if (ref_right == sheet_right) else 180
+
+    ref_ang = math.degrees(math.atan2(rdy, rdx))
+    sheet_ang = math.degrees(math.atan2(sdy, sdx))
+
+    raw = sheet_ang - ref_ang
+    while raw > 180:
+        raw -= 360
+    while raw <= -180:
+        raw += 360
+
+    snapped = round(raw / 90.0) * 90
+    if snapped == -180:
+        snapped = 180
+    if snapped == 360:
+        snapped = 0
+
+    # Confidence: how close the first-point rotation is to a clean 90 multiple.
+    deviation = abs(raw - snapped)
+    if deviation > 180:
+        deviation = 360 - deviation
+    confidence = max(0.0, 1.0 - deviation / 30.0)
+
+    if confidence < 0.5:
+        return None  # first point gave an ambiguous angle — let geometry decide
+
     return {
-        'angle': angle,
-        'confidence': 1.0,
+        'angle': int(snapped),
+        'confidence': round(confidence, 4),
         'method': 'first-point',
-        'ref_first_right': ref_right,
-        'sheet_first_right': sheet_right,
+        'raw_angle': round(raw, 1),
+        'ref_first_angle': round(ref_ang, 1),
+        'sheet_first_angle': round(sheet_ang, 1),
     }
 
 
